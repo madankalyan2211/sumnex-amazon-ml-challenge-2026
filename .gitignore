@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large dataset files & directories
+dataset/
+*.tsv
+*.csv
+output/
+staging/
+
+# Archives & model weights (>100MB)
+*.zip
+*.tar.gz
+*.pkl
+*.bin
+experiments/*.pkl
+
+# Logs & temp files
+*.log
+scratch/
+.system_generated/
+
+# OS / IDE metadata
+.DS_Store
+.idea/
+.vscode/
