@@ -1,10 +1,10 @@
 """
 Main Experiment Runner:
 1. Splits training data into Train and Held-Out Validation.
-2. Builds training target blockers.
+2. Builds training target blockers with multi-channel BM25 inverted indexes.
 3. Trains Supervised LightGBM Matcher on positives + hard negatives.
 4. Sweeps decision thresholds and evaluates on Held-Out Validation.
-5. Generates test output files (candidate_pairs.tsv and matching_results.tsv).
+5. Generates test output files with vectorized high-speed batch inference.
 6. Runs the official challenge submission validator.
 7. Packages and delivers submission files to Downloads.
 """
@@ -46,8 +46,8 @@ def run_experiment():
     
     # 3. Initialize Pipeline
     pipeline = Pipeline(
-        max_posting_len=1500,
-        max_candidates=75,
+        max_posting_len=2500,
+        max_candidates=90,
         model_path="experiments/entity_matcher.pkl"
     )
     
@@ -63,7 +63,7 @@ def run_experiment():
     print("\n[Step 4/5] Mining Training Pairs and Training LightGBM Matcher...")
     X_train, y_train = pipeline.build_training_dataset(
         train_s1, blockers, gt,
-        n_sample_s1=100000,
+        n_sample_s1=120000,
         negatives_per_positive=2,
         random_state=42
     )
@@ -76,6 +76,7 @@ def run_experiment():
     print("\n[Step 5/5] Evaluating on Held-Out Validation Set & Optimizing Macro F0.5...")
     best_f05 = pipeline.evaluate_validation(
         val_s1, blockers, gt,
+        batch_size=2500,
         verbose=True
     )
     
@@ -83,11 +84,12 @@ def run_experiment():
     del targets_df, blockers, s1_df, train_s1, val_s1, X_train, y_train, gt
     gc.collect()
     
-    # 7. Generate Test Submission
-    print("\n[Inference] Generating Final Test Predictions...")
+    # 7. Generate Test Submission with Vectorized Batch Engine
+    print("\n[Inference] Generating Final Test Predictions (Vectorized Batches)...")
     pipeline.generate_submission(
         test_dir="dataset/test",
         output_dir="output",
+        batch_size=2500,
         primary_threshold=pipeline.primary_threshold,
         sibling_threshold=pipeline.sibling_threshold
     )

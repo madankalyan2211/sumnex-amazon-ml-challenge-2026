@@ -1,7 +1,7 @@
 """
 End-to-End Entity Resolution Pipeline.
-Coordinates data loading, country partitioning, inverted index blocking,
-feature generation, LightGBM model training, dynamic sibling threshold tuning, and submission generation.
+Coordinates data loading, country partitioning, high-recall BM25 inverted index blocking,
+vectorized feature generation, LightGBM model training, dynamic sibling threshold tuning, and submission generation.
 """
 
 import os
@@ -24,16 +24,16 @@ from src.evaluation import evaluate_predictions
 class Pipeline:
     def __init__(
         self,
-        max_posting_len: int = 1500,
-        max_candidates: int = 75,
+        max_posting_len: int = 2500,
+        max_candidates: int = 90,
         model_path: str = "experiments/entity_matcher.pkl"
     ):
         self.max_posting_len = max_posting_len
         self.max_candidates = max_candidates
         self.model_path = model_path
         self.matcher = EntityMatcher()
-        self.primary_threshold = 0.82
-        self.sibling_threshold = 0.58
+        self.primary_threshold = 0.84
+        self.sibling_threshold = 0.60
 
     def build_country_blockers(
         self,
@@ -65,7 +65,7 @@ class Pipeline:
         s1_df: pd.DataFrame,
         blockers: Dict[str, FastCountryBlocker],
         ground_truth: Dict[str, Set[str]],
-        n_sample_s1: int = 80000,
+        n_sample_s1: int = 100000,
         negatives_per_positive: int = 2,
         random_state: int = 42
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -136,10 +136,11 @@ class Pipeline:
         val_s1_df: pd.DataFrame,
         blockers: Dict[str, FastCountryBlocker],
         ground_truth: Dict[str, Set[str]],
+        batch_size: int = 2500,
         verbose: bool = True
     ) -> float:
         """
-        Run end-to-end blocking, scoring, dynamic sibling threshold tuning, and evaluation on validation set.
+        Run vectorized blocking, scoring, dynamic sibling threshold tuning, and evaluation on validation set.
         """
         print(f"\n=== RUNNING VALIDATION ON {len(val_s1_df)} S1 ENTITIES ===")
         t0 = time.time()
@@ -151,69 +152,86 @@ class Pipeline:
         recalled_cands = 0
         total_eval_true = 0
         
-        for s1_rec in tqdm(s1_records, desc="Scoring Val S1"):
-            s1_id = s1_rec['entity_id']
-            country = s1_rec['country']
-            blocker = blockers.get(country)
-            if not blocker:
-                continue
+        n_batches = (len(s1_records) + batch_size - 1) // batch_size
+        
+        for b_idx in tqdm(range(n_batches), desc="Scoring Val Batches"):
+            batch = s1_records[b_idx * batch_size : (b_idx + 1) * batch_size]
+            
+            batch_feats = []
+            batch_meta = []
+            
+            for s1_rec in batch:
+                s1_id = s1_rec['entity_id']
+                country = s1_rec['country']
+                blocker = blockers.get(country)
                 
-            s1_n_norm = normalize_name_fast(s1_rec['business_name'])
-            s1_a_norm = normalize_address_fast(s1_rec['business_address'])
-            
-            cand_indices = blocker.query(s1_n_norm, s1_a_norm)
-            
-            true_m = val_gt.get(s1_id, set())
-            total_eval_true += len(true_m)
-            recalled_cands += sum(1 for idx in cand_indices if blocker.target_ids[idx] in true_m)
-            
-            if not cand_indices:
+                true_m = val_gt.get(s1_id, set())
+                total_eval_true += len(true_m)
+                
+                if not blocker:
+                    batch_meta.append((s1_id, [], [], [], []))
+                    continue
+                    
+                s1_n_norm = normalize_name_fast(s1_rec['business_name'])
+                s1_a_norm = normalize_address_fast(s1_rec['business_address'])
+                
+                cand_indices = blocker.query(s1_n_norm, s1_a_norm)
+                recalled_cands += sum(1 for idx in cand_indices if blocker.target_ids[idx] in true_m)
+                
+                if not cand_indices:
+                    batch_meta.append((s1_id, [], [], [], []))
+                    continue
+                    
+                cand_tids = []
+                cand_bases = []
+                cand_compact_bases = []
+                cand_nums = []
+                
+                for idx in cand_indices:
+                    tid = blocker.target_ids[idx]
+                    tgt_name = blocker.target_names[idx]
+                    tgt_addr = blocker.target_addrs[idx]
+                    
+                    tgt_n_norm = normalize_name_fast(tgt_name)
+                    tgt_a_norm = normalize_address_fast(tgt_addr)
+                    
+                    f = extract_pairwise_features(
+                        (s1_n_norm, s1_a_norm),
+                        (tgt_n_norm, tgt_a_norm)
+                    )
+                    batch_feats.append(f)
+                    cand_tids.append(tid)
+                    cand_bases.append(tgt_n_norm[1])
+                    cand_compact_bases.append(tgt_n_norm[3])
+                    cand_nums.append(tgt_a_norm[3])
+                    
+                batch_meta.append((s1_id, cand_tids, cand_bases, cand_compact_bases, cand_nums))
+                
+            # Vectorized batch prediction
+            if batch_feats:
+                feats_arr = np.array(batch_feats, dtype=np.float32)
+                batch_probs = self.matcher.predict_proba(feats_arr)
+            else:
+                batch_probs = np.array([])
+                
+            offset = 0
+            for s1_id, cand_tids, cand_bases, cand_compact_bases, cand_nums in batch_meta:
+                k = len(cand_tids)
+                if k > 0:
+                    probs = batch_probs[offset : offset + k]
+                    offset += k
+                else:
+                    probs = np.array([])
+                    
                 val_items.append({
                     's1_id': s1_id,
-                    'cand_tids': [],
-                    'probs': np.array([]),
-                    'cand_bases': [],
-                    'cand_compact_bases': [],
-                    'cand_nums': []
+                    'cand_tids': cand_tids,
+                    'probs': probs,
+                    'cand_bases': cand_bases,
+                    'cand_compact_bases': cand_compact_bases,
+                    'cand_nums': cand_nums
                 })
-                continue
                 
-            feats = []
-            cand_tids = []
-            cand_bases = []
-            cand_compact_bases = []
-            cand_nums = []
-            
-            for idx in cand_indices:
-                tid = blocker.target_ids[idx]
-                tgt_name = blocker.target_names[idx]
-                tgt_addr = blocker.target_addrs[idx]
-                
-                tgt_n_norm = normalize_name_fast(tgt_name)
-                tgt_a_norm = normalize_address_fast(tgt_addr)
-                
-                f = extract_pairwise_features(
-                    (s1_n_norm, s1_a_norm),
-                    (tgt_n_norm, tgt_a_norm)
-                )
-                feats.append(f)
-                cand_tids.append(tid)
-                cand_bases.append(tgt_n_norm[1])
-                cand_compact_bases.append(tgt_n_norm[3])
-                cand_nums.append(tgt_a_norm[3])
-                
-            feats_arr = np.array(feats, dtype=np.float32)
-            probs = self.matcher.predict_proba(feats_arr)
-            
-            val_items.append({
-                's1_id': s1_id,
-                'cand_tids': cand_tids,
-                'probs': probs,
-                'cand_bases': cand_bases,
-                'cand_compact_bases': cand_compact_bases,
-                'cand_nums': cand_nums
-            })
-            
         print(f"\nCandidate Recall on Val: {recalled_cands} / {total_eval_true} ({recalled_cands/(total_eval_true+1e-9)*100:.2f}%)")
         
         best_p_th, best_s_th, best_f05, metrics = sweep_dynamic_sibling_thresholds(
@@ -229,17 +247,18 @@ class Pipeline:
         self,
         test_dir: str = "dataset/test",
         output_dir: str = "output",
+        batch_size: int = 2500,
         primary_threshold: Optional[float] = None,
         sibling_threshold: Optional[float] = None
     ):
         """
-        Generate both output/candidate_pairs.tsv and output/matching_results.tsv for test set.
-        Processes country by country to minimize peak memory usage.
+        Generate both output/candidate_pairs.tsv and output/matching_results.tsv for test set
+        using high-performance vectorized batch inference.
         """
         p_th = primary_threshold if primary_threshold is not None else self.primary_threshold
         s_th = sibling_threshold if sibling_threshold is not None else self.sibling_threshold
         
-        print(f"\n=== GENERATING TEST SUBMISSION (Primary Th = {p_th:.3f}, Sibling Th = {s_th:.3f}) ===")
+        print(f"\n=== GENERATING TEST SUBMISSION (Primary Th = {p_th:.3f}, Sibling Th = {s_th:.3f}, Batch Size = {batch_size}) ===")
         t0 = time.time()
         os.makedirs(output_dir, exist_ok=True)
         
@@ -253,12 +272,10 @@ class Pipeline:
         
         print(f"Test S1: {len(test_s1)} | Test S2: {len(test_s2)} | Test S3: {len(test_s3)}")
         
-        # Combine S2 + S3
         test_targets = pd.concat([test_s2, test_s3], ignore_index=True)
         del test_s2, test_s3
         gc.collect()
         
-        # Open output files
         with open(matching_path, 'w', encoding='utf-8') as f_match, \
              open(candidate_path, 'w', encoding='utf-8') as f_cand:
              
@@ -269,7 +286,6 @@ class Pipeline:
             total_cands_count = 0
             total_s1_processed = 0
             
-            # Process country by country
             unique_countries = list(test_s1['country'].unique())
             print(f"Processing countries: {unique_countries}")
             
@@ -293,87 +309,107 @@ class Pipeline:
                 )
                 
                 s1_records = country_s1.to_dict('records')
+                n_batches = (len(s1_records) + batch_size - 1) // batch_size
                 
-                for s1_rec in tqdm(s1_records, desc=f"Inference [{country}]"):
-                    s1_id = s1_rec['entity_id']
+                for b_idx in tqdm(range(n_batches), desc=f"Vectorized Inference [{country}]"):
+                    batch = s1_records[b_idx * batch_size : (b_idx + 1) * batch_size]
                     
-                    s1_n_norm = normalize_name_fast(s1_rec['business_name'])
-                    s1_a_norm = normalize_address_fast(s1_rec['business_address'])
+                    batch_feats = []
+                    batch_meta = []
                     
-                    cand_indices = blocker.query(s1_n_norm, s1_a_norm)
-                    
-                    if not cand_indices:
-                        f_match.write(f"{s1_id}\t\n")
-                        f_cand.write(f"{s1_id}\t\n")
-                        total_s1_processed += 1
-                        continue
+                    for s1_rec in batch:
+                        s1_id = s1_rec['entity_id']
                         
-                    feats = []
-                    cand_tids = []
-                    cand_bases = []
-                    cand_compact_bases = []
-                    cand_nums = []
-                    
-                    for idx in cand_indices:
-                        tid = blocker.target_ids[idx]
-                        tgt_name = blocker.target_names[idx]
-                        tgt_addr = blocker.target_addrs[idx]
+                        s1_n_norm = normalize_name_fast(s1_rec['business_name'])
+                        s1_a_norm = normalize_address_fast(s1_rec['business_address'])
                         
-                        tgt_n_norm = normalize_name_fast(tgt_name)
-                        tgt_a_norm = normalize_address_fast(tgt_addr)
+                        cand_indices = blocker.query(s1_n_norm, s1_a_norm)
                         
-                        f = extract_pairwise_features(
-                            (s1_n_norm, s1_a_norm),
-                            (tgt_n_norm, tgt_a_norm)
-                        )
-                        feats.append(f)
-                        cand_tids.append(tid)
-                        cand_bases.append(tgt_n_norm[1])
-                        cand_compact_bases.append(tgt_n_norm[3])
-                        cand_nums.append(tgt_a_norm[3])
-                        
-                    feats_arr = np.array(feats, dtype=np.float32)
-                    probs = self.matcher.predict_proba(feats_arr)
-                    
-                    # Anchor-Conditioned Dynamic Sibling Matching
-                    primary_indices = [i for i in range(len(cand_tids)) if probs[i] >= p_th]
-                    if primary_indices:
-                        anchor_bases = {cand_bases[i] for i in primary_indices if cand_bases[i]}
-                        anchor_cbases = {cand_compact_bases[i] for i in primary_indices if cand_compact_bases[i]}
-                        anchor_nums = set()
-                        for i in primary_indices:
-                            anchor_nums.update(cand_nums[i])
+                        if not cand_indices:
+                            batch_meta.append((s1_id, [], [], [], []))
+                            continue
                             
-                        matched_ids = [cand_tids[i] for i in primary_indices]
-                        for j in range(len(cand_tids)):
-                            if j in primary_indices:
-                                continue
-                            if probs[j] >= s_th:
-                                cb = cand_bases[j]
-                                ccb = cand_compact_bases[j]
-                                cn = cand_nums[j]
-                                name_match = (cb and cb in anchor_bases) or (ccb and ccb in anchor_cbases)
-                                num_match = bool(cn and (cn & anchor_nums))
-                                if name_match or num_match:
-                                    matched_ids.append(cand_tids[j])
-                    else:
-                        matched_ids = [cand_tids[i] for i in range(len(cand_tids)) if probs[i] >= (p_th + 0.04)]
+                        cand_tids = []
+                        cand_bases = []
+                        cand_compact_bases = []
+                        cand_nums = []
                         
-                    # Deduplicate while preserving order
-                    cand_tids_unique = list(dict.fromkeys(cand_tids))
-                    matched_ids_unique = list(dict.fromkeys(matched_ids))
-                    
-                    cand_str = ",".join(cand_tids_unique)
-                    match_str = ",".join(matched_ids_unique)
-                    
-                    f_cand.write(f"{s1_id}\t{cand_str}\n")
-                    f_match.write(f"{s1_id}\t{match_str}\n")
-                    
-                    total_cands_count += len(cand_tids_unique)
-                    total_matches_count += len(matched_ids_unique)
-                    total_s1_processed += 1
-                    
-                # Free country blocker memory
+                        for idx in cand_indices:
+                            tid = blocker.target_ids[idx]
+                            tgt_name = blocker.target_names[idx]
+                            tgt_addr = blocker.target_addrs[idx]
+                            
+                            tgt_n_norm = normalize_name_fast(tgt_name)
+                            tgt_a_norm = normalize_address_fast(tgt_addr)
+                            
+                            f = extract_pairwise_features(
+                                (s1_n_norm, s1_a_norm),
+                                (tgt_n_norm, tgt_a_norm)
+                            )
+                            batch_feats.append(f)
+                            cand_tids.append(tid)
+                            cand_bases.append(tgt_n_norm[1])
+                            cand_compact_bases.append(tgt_n_norm[3])
+                            cand_nums.append(tgt_a_norm[3])
+                            
+                        batch_meta.append((s1_id, cand_tids, cand_bases, cand_compact_bases, cand_nums))
+                        
+                    # Batch LightGBM Predict
+                    if batch_feats:
+                        feats_arr = np.array(batch_feats, dtype=np.float32)
+                        batch_probs = self.matcher.predict_proba(feats_arr)
+                    else:
+                        batch_probs = np.array([])
+                        
+                    offset = 0
+                    for s1_id, cand_tids, cand_bases, cand_compact_bases, cand_nums in batch_meta:
+                        k = len(cand_tids)
+                        if k == 0:
+                            f_match.write(f"{s1_id}\t\n")
+                            f_cand.write(f"{s1_id}\t\n")
+                            total_s1_processed += 1
+                            continue
+                            
+                        probs = batch_probs[offset : offset + k]
+                        offset += k
+                        
+                        # Anchor-Conditioned Dynamic Sibling Matching
+                        primary_indices = [i for i in range(k) if probs[i] >= p_th]
+                        if primary_indices:
+                            anchor_bases = {cand_bases[i] for i in primary_indices if cand_bases[i]}
+                            anchor_cbases = {cand_compact_bases[i] for i in primary_indices if cand_compact_bases[i]}
+                            anchor_nums = set()
+                            for i in primary_indices:
+                                anchor_nums.update(cand_nums[i])
+                                
+                            matched_ids = [cand_tids[i] for i in primary_indices]
+                            for j in range(k):
+                                if j in primary_indices:
+                                    continue
+                                if probs[j] >= s_th:
+                                    cb = cand_bases[j]
+                                    ccb = cand_compact_bases[j]
+                                    cn = cand_nums[j]
+                                    name_match = (cb and cb in anchor_bases) or (ccb and ccb in anchor_cbases)
+                                    num_match = bool(cn and (cn & anchor_nums))
+                                    if name_match or num_match:
+                                        matched_ids.append(cand_tids[j])
+                        else:
+                            matched_ids = [cand_tids[i] for i in range(k) if probs[i] >= (p_th + 0.04)]
+                            
+                        cand_tids_unique = list(dict.fromkeys(cand_tids))
+                        matched_ids_unique = list(dict.fromkeys(matched_ids))
+                        
+                        cand_str = ",".join(cand_tids_unique)
+                        match_str = ",".join(matched_ids_unique)
+                        
+                        f_cand.write(f"{s1_id}\t{cand_str}\n")
+                        f_match.write(f"{s1_id}\t{match_str}\n")
+                        
+                        total_cands_count += len(cand_tids_unique)
+                        total_matches_count += len(matched_ids_unique)
+                        total_s1_processed += 1
+                        
                 del blocker, country_targets, country_s1
                 gc.collect()
                 

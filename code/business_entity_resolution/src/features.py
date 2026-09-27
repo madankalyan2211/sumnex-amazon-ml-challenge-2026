@@ -7,6 +7,8 @@ from typing import Dict, Tuple, Set, List, Any
 import numpy as np
 from rapidfuzz import fuzz
 
+from src.normalization import GENERIC_ADDR_TOKENS
+
 FEATURE_NAMES = [
     'name_exact_clean',
     'name_exact_base',
@@ -28,6 +30,7 @@ FEATURE_NAMES = [
     'addr_exact_clean',
     'addr_token_jaccard',
     'addr_token_overlap',
+    'addr_rare_token_overlap',
     'addr_num_exact',
     'addr_num_jaccard',
     'addr_num_overlap',
@@ -42,6 +45,7 @@ FEATURE_NAMES = [
     'num_exact_name_fuzz_high',
     'name_exact_diff_num',
     'token_count_diff',
+    'name_lcs_ratio',
 ]
 
 def jaccard_similarity(set1: Set[Any], set2: Set[Any]) -> float:
@@ -124,6 +128,11 @@ def extract_pairwise_features(
     addr_token_jaccard = jaccard_similarity(s1_addr_token_set, tgt_addr_token_set)
     addr_token_overlap = float(len(s1_addr_token_set & tgt_addr_token_set))
     
+    # Rare address token overlap (excluding generic street words)
+    s1_rare_addr = s1_addr_token_set - GENERIC_ADDR_TOKENS
+    tgt_rare_addr = tgt_addr_token_set - GENERIC_ADDR_TOKENS
+    addr_rare_token_overlap = float(len(s1_rare_addr & tgt_rare_addr))
+    
     # 6. Address numeric features
     addr_num_exact = 1.0 if s1_addr_numbers == tgt_addr_numbers and s1_addr_numbers else 0.0
     addr_num_jaccard = jaccard_similarity(s1_addr_numbers, tgt_addr_numbers)
@@ -146,6 +155,7 @@ def extract_pairwise_features(
     exact_name_same_num = 1.0 if (name_exact_base == 1.0 and addr_num_overlap > 0) else 0.0
     num_exact_name_fuzz_high = 1.0 if (addr_num_overlap > 0 and name_fuzz_token_set_ratio >= 0.85) else 0.0
     name_exact_diff_num = 1.0 if (name_exact_base == 1.0 and addr_num_mismatch == 1.0) else 0.0
+    name_lcs_ratio = (name_fuzz_partial_ratio + name_fuzz_ratio) / 2.0
 
     return [
         name_exact_clean,
@@ -168,6 +178,7 @@ def extract_pairwise_features(
         addr_exact_clean,
         addr_token_jaccard,
         addr_token_overlap,
+        addr_rare_token_overlap,
         addr_num_exact,
         addr_num_jaccard,
         addr_num_overlap,
@@ -182,4 +193,5 @@ def extract_pairwise_features(
         num_exact_name_fuzz_high,
         name_exact_diff_num,
         token_count_diff,
+        name_lcs_ratio,
     ]

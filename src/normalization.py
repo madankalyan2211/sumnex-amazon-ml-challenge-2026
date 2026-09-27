@@ -1,7 +1,8 @@
 """
 Production-grade, ultra-fast normalization engine for Business Entity Resolution.
 Processes >150,000 strings/sec with Unicode NFKD decomposition,
-safe legal suffix stripping, address tokenization, and numeric component extraction.
+OCR substitution repair, safe legal suffix stripping, address tokenization,
+and recursive domain/compact name cleaning.
 """
 
 import re
@@ -61,6 +62,14 @@ LEGAL_SUFFIXES = {
     'sarl', 'sas', 'sasu', 'sa', 'sci', 'snc', 'eurl', 'ste', 'societe',
 }
 
+# Domain legal keywords for recursive stripping
+DOMAIN_LEGAL_WORDS = [
+    'services', 'service', 'technologies', 'technology', 'enterprises', 'enterprise',
+    'international', 'solutions', 'group', 'holdings', 'industries', 'trading',
+    'corporation', 'private', 'limited', 'pvt', 'ltd', 'the', 'shree', 'shri',
+    'associates', 'consulting'
+]
+
 # High-frequency cross-lingual & business synonyms
 NAME_SYNONYMS = {
     'shree': 'sri',
@@ -71,14 +80,17 @@ NAME_SYNONYMS = {
     'jewellery': 'jewel',
     'chemist': 'pharmacy',
     'medicals': 'pharmacy',
+    'medical': 'pharmacy',
     'stores': 'store',
     'bhandar': 'store',
     'traders': 'trading',
     'ste': 'saint',
     'sainte': 'saint',
+    'dr': 'doctor',
+    'auto': 'automotive',
 }
 
-# Standard address abbreviations
+# Standard address abbreviations across US, India, France
 ADDRESS_EXPANSIONS = {
     'rd': 'road',
     'st': 'street',
@@ -98,12 +110,25 @@ ADDRESS_EXPANSIONS = {
     'apt': 'apartment',
     'ste': 'suite',
     'fl': 'floor',
+    'flr': 'floor',
     'bldg': 'building',
     'opp': 'opposite',
     'nr': 'near',
     'h': 'house',
     'no': 'number',
     'r': 'rue',
+    'all': 'allee',
+    'chem': 'chemin',
+    'imp': 'impasse',
+    'bat': 'batiment',
+    'res': 'residence',
+}
+
+GENERIC_ADDR_TOKENS = {
+    'road', 'street', 'lane', 'avenue', 'marg', 'nagar', 'colony', 'floor',
+    'block', 'plot', 'near', 'opposite', 'house', 'number', 'bldg', 'complex',
+    'cross', 'main', 'rd', 'st', 'fl', 'no', 'opp', 'nr', 'apartment', 'suite',
+    'building', 'drive', 'court', 'place', 'circle', 'highway', 'parkway', 'rue'
 }
 
 def clean_string(text: str) -> str:
@@ -120,6 +145,29 @@ def clean_string(text: str) -> str:
     norm = norm.translate(TRANS_TABLE)
     return " ".join(norm.split())
 
+def clean_compact_base(text: str) -> str:
+    """Recursively strip legal prefixes and suffixes from compact/domain strings."""
+    if not text or not isinstance(text, str):
+        return ""
+    norm = unicodedata.normalize('NFKD', text)
+    norm = "".join(c for c in norm if not unicodedata.combining(c)).lower()
+    norm = RE_DOMAIN.sub('', norm)
+    norm = re.sub(r'[^a-z0-9]', '', norm)
+    
+    changed = True
+    while changed and len(norm) >= 7:
+        changed = False
+        for w in DOMAIN_LEGAL_WORDS:
+            if norm.startswith(w) and len(norm) > len(w) + 2:
+                norm = norm[len(w):]
+                changed = True
+                break
+            if norm.endswith(w) and len(norm) > len(w) + 2:
+                norm = norm[:-len(w)]
+                changed = True
+                break
+    return norm
+
 def normalize_name_fast(name: str) -> Tuple[str, str, str, str, Tuple[str, ...], Tuple[str, ...], Set[str]]:
     """
     Fast normalized tuple representation of a name:
@@ -128,10 +176,12 @@ def normalize_name_fast(name: str) -> Tuple[str, str, str, str, Tuple[str, ...],
     cleaned = clean_string(name)
     raw_tokens = cleaned.split() if cleaned else []
     tokens = tuple(NAME_SYNONYMS.get(t, t) for t in raw_tokens)
-    base_tokens = tuple(t for t in tokens if t not in LEGAL_SUFFIXES)
+    base_tokens = tuple(t for t in tokens if t not in LEGAL_SUFFIXES and len(t) >= 2)
     base = " ".join(base_tokens) if base_tokens else " ".join(tokens)
     compact = "".join(tokens)
-    compact_base = "".join(base_tokens) if base_tokens else compact
+    compact_base = clean_compact_base(name)
+    if not compact_base:
+        compact_base = "".join(base_tokens) if base_tokens else compact
     
     char_3grams = set()
     if len(compact) >= 3:
@@ -149,7 +199,8 @@ def normalize_address_fast(address: str) -> Tuple[str, Tuple[str, ...], Set[str]
     tokens_list = []
     for t in raw_cleaned.split():
         expanded = ADDRESS_EXPANSIONS.get(t, t)
-        tokens_list.append(expanded)
+        if len(expanded) >= 2:
+            tokens_list.append(expanded)
         
     tokens = tuple(tokens_list)
     cleaned = " ".join(tokens)
@@ -164,4 +215,3 @@ def normalize_address_fast(address: str) -> Tuple[str, Tuple[str, ...], Set[str]
                 numbers.add(n)
                 
     return cleaned, tokens, token_set, numbers
-

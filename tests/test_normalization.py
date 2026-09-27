@@ -1,25 +1,26 @@
-from src.normalization import normalize_name, normalize_address
+import unittest
+from src.normalization import normalize_name_fast, normalize_address_fast
 
-def test_normalization():
-    n1 = normalize_name("Team Air Pvt. Ltd.")
-    n2 = normalize_name("TEAMAIR.COM")
-    print("n1:", n1)
-    print("n2:", n2)
-    assert n1['compact'] == 'teamairpvtltd' or 'teamair' in n1['compact']
-    assert n2['compact'] == 'teamair'
-    
-    n3 = normalize_name("LLC Moncada Léarning Center")
-    print("n3:", n3)
-    assert 'learning' in n3['cleaned']
-    
-    a1 = normalize_address("175 Boulevard du Président Franklin Roosevelt")
-    a2 = normalize_address("175 BD DU PRESIDENT FRANKLIN ROOSEVELT")
-    print("a1:", a1)
-    print("a2:", a2)
-    assert a1['numbers'] == {'175'}
-    assert a2['numbers'] == {'175'}
-    assert a1['cleaned'] == a2['cleaned']
-    print("Normalization tests passed!")
+class TestNormalization(unittest.TestCase):
+    def test_name_normalization(self):
+        cleaned, base, compact, compact_base, tokens, base_tokens, char_3grams = normalize_name_fast("Team Air Pvt. Ltd.")
+        self.assertEqual(base, "team air")
+        self.assertEqual(compact_base, "teamair")
+        
+        c2, b2, comp2, cb2, t2, bt2, g2 = normalize_name_fast("TEAMAIR.COM")
+        self.assertEqual(cb2, "teamair")
+        self.assertEqual(compact_base, cb2)
+        
+        c3, b3, comp3, cb3, t3, bt3, g3 = normalize_name_fast("SERVICESCPMEDUSERVE.COM")
+        self.assertEqual(cb3, "cpmeduserve")
+
+    def test_address_normalization(self):
+        cleaned1, tokens1, token_set1, numbers1 = normalize_address_fast("175 Boulevard du Président Franklin Roosevelt")
+        cleaned2, tokens2, token_set2, numbers2 = normalize_address_fast("175 BD DU PRESIDENT FRANKLIN ROOSEVELT")
+        
+        self.assertEqual(numbers1, {'175'})
+        self.assertEqual(numbers2, {'175'})
+        self.assertEqual(cleaned1, cleaned2)
 
 if __name__ == "__main__":
-    test_normalization()
+    unittest.main()
